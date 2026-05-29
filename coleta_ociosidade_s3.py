@@ -19,27 +19,97 @@ threshold_date_60 = end_time - timedelta(days=60) # Limite de 2 meses para EC2/E
 # Snapshots - O usuário solicitou manualmente 'Anteriores à Feveireiro/2026'
 limit_snapshot_date = datetime(2026, 2, 1, tzinfo=timezone.utc)
 
-# Tabela genérica para ter base financeira aproximada pra EC2/RDS 
-EC2_PRICES_MONTHLY = {
-    't2.micro': 8.5, 't2.small': 17.0, 't2.medium': 34.0, 't2.large': 68.0,
-    't3.micro': 7.5, 't3.small': 15.0, 't3.medium': 30.0, 't3.large': 60.0, 't3.xlarge': 120.0,
-    't3a.micro': 6.8, 't3a.small': 13.5, 't3a.medium': 27.0, 't3a.large': 54.0, 't3a.xlarge': 108.0,
-    'm5.large': 70.0, 'm5.xlarge': 140.0, 'm5.2xlarge': 280.0,
-    'c5.large': 62.0, 'c5.xlarge': 124.0, 'c5.2xlarge': 248.0,
-    'r5.large': 92.0, 'r5.xlarge': 184.0, 'r5.2xlarge': 368.0
-}
-
-CACHE_PRICES_MONTHLY = {
-    'cache.t2.micro': 12.0, 'cache.t2.small': 24.0, 'cache.t2.medium': 48.0,
-    'cache.t3.micro': 10.0, 'cache.t3.small': 20.0, 'cache.t3.medium': 40.0,
-    'cache.t4g.micro': 8.5, 'cache.t4g.small': 17.0, 'cache.t4g.medium': 34.0,
-    'cache.m5.large': 110.0, 'cache.m5.xlarge': 220.0,
-    'cache.r5.large': 150.0, 'cache.r5.xlarge': 300.0
-}
-
+# Tabela genérica para ter base financeira aproximada pra EC2/RDS/ElastiCache baseada em us-east-1
 def get_ec2_cost(instance_type):
-    # Base de instâncias genéricas, se o modelo for absurdo cobra default=50USD
-    return EC2_PRICES_MONTHLY.get(instance_type, 50.0) 
+    # Dicionário de preço base mensal para o tamanho 'large' (us-east-1, Linux sob demanda)
+    base_prices = {
+        # Família T
+        't2': 67.74, 't3': 60.74, 't3a': 54.90, 't4g': 49.06,
+        # Família M
+        'm5': 70.08, 'm5a': 62.78, 'm5ad': 73.00, 'm5d': 82.49, 
+        'm6g': 56.21, 'm6gd': 66.43, 'm6i': 70.08, 'm6id': 83.22,
+        'm7g': 59.86, 'm7i': 73.73, 'm7a': 84.68,
+        # Família C
+        'c5': 62.05, 'c5a': 56.21, 'c5ad': 63.51, 'c5d': 69.35,
+        'c6g': 49.64, 'c6gd': 59.86, 'c6i': 62.05, 'c6id': 75.19,
+        'c7g': 52.56, 'c7i': 64.97, 'c7a': 75.92,
+        # Família R
+        'r5': 91.98, 'r5a': 82.49, 'r5ad': 95.63, 'r5d': 105.12,
+        'r6g': 73.73, 'r6gd': 86.87, 'r6i': 91.98, 'r6id': 108.77,
+        'r7g': 78.84, 'r7i': 97.09, 'r7a': 110.96,
+        # Outras comuns
+        'i3': 113.88, 'i3en': 163.52, 'i4g': 97.82, 'i4i': 121.18,
+        'g4dn': 382.52, 'g5': 588.38, 'p3': 2233.80, 'p4': 23928.77
+    }
+    
+    multipliers = {
+        'nano': 0.0625,
+        'micro': 0.125,
+        'small': 0.25,
+        'medium': 0.5,
+        'large': 1.0,
+        'xlarge': 2.0,
+        '2xlarge': 4.0,
+        '3xlarge': 6.0,
+        '4xlarge': 8.0,
+        '8xlarge': 16.0,
+        '9xlarge': 18.0,
+        '12xlarge': 24.0,
+        '16xlarge': 32.0,
+        '18xlarge': 36.0,
+        '24xlarge': 48.0,
+        '32xlarge': 64.0,
+        '48xlarge': 96.0
+    }
+    
+    try:
+        raw_type = instance_type.lower()
+        factor = 1.0
+        
+        # Trata prefixo RDS db.
+        if raw_type.startswith('db.'):
+            raw_type = raw_type[3:]
+            
+        # Trata prefixo ElastiCache cache.
+        if raw_type.startswith('cache.'):
+            raw_type = raw_type[6:]
+            factor = 1.25 # Cache premium factor
+            
+        parts = raw_type.split('.')
+        if len(parts) != 2:
+            return 50.0 * factor
+            
+        family, size = parts[0], parts[1]
+        
+        price_base = base_prices.get(family)
+        if price_base is None:
+            first_char = family[0]
+            if first_char == 't':
+                price_base = 55.0
+            elif first_char == 'c':
+                price_base = 60.0
+            elif first_char == 'm':
+                price_base = 70.0
+            elif first_char == 'r':
+                price_base = 90.0
+            else:
+                price_base = 100.0
+                
+        mult = multipliers.get(size)
+        if mult is None:
+            if 'xlarge' in size:
+                prefix = size.replace('xlarge', '')
+                if prefix.isdigit():
+                    mult = int(prefix) * 2.0
+                else:
+                    mult = 2.0
+            else:
+                mult = 1.0
+                
+        return price_base * mult * factor
+    except:
+        return 50.0 * factor
+
 
 def create_s3_bucket(s3_client, bucket_name, region):
     try:
@@ -231,7 +301,7 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, logs
                 qid = cid.replace('-', '_').replace('.', '_')
                 qid = 'ec_' + ''.join(c for c in qid if c.isalnum() or c == '_').lower()
                 
-                price_per_node = CACHE_PRICES_MONTHLY.get(node_type, 30.0)
+                price_per_node = get_ec2_cost(node_type)
                 custo_base = price_per_node * num_nodes
                 
                 cache_meta[qid] = {'id': cid, 'type': node_type, 'nodes': num_nodes, 'custo': custo_base, 'engine': engine}
