@@ -29,6 +29,14 @@ EC2_PRICES_MONTHLY = {
     'r5.large': 92.0, 'r5.xlarge': 184.0, 'r5.2xlarge': 368.0
 }
 
+CACHE_PRICES_MONTHLY = {
+    'cache.t2.micro': 12.0, 'cache.t2.small': 24.0, 'cache.t2.medium': 48.0,
+    'cache.t3.micro': 10.0, 'cache.t3.small': 20.0, 'cache.t3.medium': 40.0,
+    'cache.t4g.micro': 8.5, 'cache.t4g.small': 17.0, 'cache.t4g.medium': 34.0,
+    'cache.m5.large': 110.0, 'cache.m5.xlarge': 220.0,
+    'cache.r5.large': 150.0, 'cache.r5.xlarge': 300.0
+}
+
 def get_ec2_cost(instance_type):
     # Base de instâncias genéricas, se o modelo for absurdo cobra default=50USD
     return EC2_PRICES_MONTHLY.get(instance_type, 50.0) 
@@ -70,7 +78,7 @@ def assume_role(account_id, role_name):
     except:
         return None
 
-def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, account_name):
+def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, logs_client, ddb_client, cache_client, account_name):
     idle = []
     
     # 1. EC2 Zumbis (últimos 90 dias)
@@ -116,10 +124,8 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, acco
     # 3. Snapshots Manuais (+ Antigos que Fevereiro 2026)
     print(f"--- MAPEANDO SNAPSHOTS ANTIGOS ---")
     try:
-        # Busca apenas os da própria conta (Self)
         snaps = ec2_client.describe_snapshots(OwnerIds=['self']).get('Snapshots', [])
         for snap in snaps:
-            # Filtro Data e exclusão de snapshots gerados pelo Backup Automático (IAM/AMI)
             if snap['StartTime'] < limit_snapshot_date:
                 desc = snap.get('Description', '').lower()
                 if 'createimage' not in desc and 'copied for destinationami' not in desc:
@@ -137,7 +143,7 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, acco
         idle.append([account_name, 'EIP', name, eip['PublicIp'], 'IPv4', '-', '-', '-', 'Solto', "$3.60"])
 
     # ================= CLOUDWATCH 30 DIAS =================
-    queries_30, rds_data, nat_data = [], {}, {}
+    queries_30, rds_data, nat_data, ddb_meta, cache_meta = [], {}, {}, {}, {}
     
     # 5. RDS Bancos de Dados
     print(f"--- MAPEANDO BANCOS RDS ---")
@@ -164,12 +170,94 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, acco
     except Exception as e:
         print(f"Erro ao listar NAT Gateways: {e}")
 
-    # Processamento Final das metricas de RDS e NAT
+    # 7. DynamoDB Tabelas Ociosas
+    print(f"--- MAPEANDO DYNAMODB ---")
+    try:
+        tables = ddb_client.list_tables().get('TableNames', [])
+        for table in tables:
+            desc = ddb_client.describe_table(TableName=table).get('Table', {})
+            provisioned = desc.get('ProvisionedThroughput', {})
+            rcu = provisioned.get('ReadCapacityUnits', 0)
+            wcu = provisioned.get('WriteCapacityUnits', 0)
+            billing_mode = desc.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED')
+            
+            custo_base = 0.0
+            if billing_mode == 'PROVISIONED':
+                custo_base = (rcu * 0.09) + (wcu * 0.47)
+                
+            qid = table.replace('-', '_').replace('.', '_')
+            qid = 'ddb_' + ''.join(c for c in qid if c.isalnum() or c == '_').lower()
+            
+            ddb_meta[qid] = {'name': table, 'rcu': rcu, 'wcu': wcu, 'custo': custo_base}
+            
+            queries_30.append({
+                'Id': f"r_{qid}",
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/DynamoDB',
+                        'MetricName': 'ConsumedReadCapacityUnits',
+                        'Dimensions': [{'Name': 'TableName', 'Value': table}]
+                    },
+                    'Period': 86400,
+                    'Stat': 'Sum'
+                },
+                'ReturnData': True
+            })
+            queries_30.append({
+                'Id': f"w_{qid}",
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/DynamoDB',
+                        'MetricName': 'ConsumedWriteCapacityUnits',
+                        'Dimensions': [{'Name': 'TableName', 'Value': table}]
+                    },
+                    'Period': 86400,
+                    'Stat': 'Sum'
+                },
+                'ReturnData': True
+            })
+    except Exception as e:
+        print(f"Erro ao listar DynamoDB: {e}")
+
+    # 8. ElastiCache Clusters Ociosos
+    print(f"--- MAPEANDO ELASTICACHE ---")
+    try:
+        for cluster in cache_client.describe_cache_clusters(ShowCacheNodeInfo=False).get('CacheClusters', []):
+            cid = cluster['CacheClusterId']
+            if cluster['CacheClusterStatus'] == 'available':
+                node_type = cluster['CacheNodeType']
+                num_nodes = cluster.get('NumCacheNodes', 1)
+                engine = cluster.get('Engine', 'redis')
+                qid = cid.replace('-', '_').replace('.', '_')
+                qid = 'ec_' + ''.join(c for c in qid if c.isalnum() or c == '_').lower()
+                
+                price_per_node = CACHE_PRICES_MONTHLY.get(node_type, 30.0)
+                custo_base = price_per_node * num_nodes
+                
+                cache_meta[qid] = {'id': cid, 'type': node_type, 'nodes': num_nodes, 'custo': custo_base, 'engine': engine}
+                
+                queries_30.append({
+                    'Id': qid,
+                    'MetricStat': {
+                        'Metric': {
+                            'Namespace': 'AWS/ElastiCache',
+                            'MetricName': 'CurrConnections',
+                            'Dimensions': [{'Name': 'CacheClusterId', 'Value': cid}]
+                        },
+                        'Period': 86400,
+                        'Stat': 'Average'
+                    },
+                    'ReturnData': True
+                })
+    except Exception as e:
+        print(f"Erro ao listar ElastiCache: {e}")
+
+    # Processamento Final das metricas de RDS, NAT, DynamoDB e ElastiCache
     if queries_30:
         metrics_30 = fetch_cw_metrics(cw_client, queries_30, start_time_30, end_time)
         for qid, data in rds_data.items():
             conn_avg = metrics_30.get(f"rds_{qid}", 0.0)
-            if conn_avg < 1.0: # Se a soma diária de conexões do mês foi essencialmente zero
+            if conn_avg < 1.0:
                 custo = round(get_ec2_cost(data['type']), 2) 
                 idle.append([account_name, 'RDS DB', data['id'], data['id'], data['type'], '-', '-', '-', 'Sem Conexões (30d)', f"${custo}"])
                 
@@ -178,7 +266,22 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, acco
             if conn_avg < 1.0:
                 idle.append([account_name, 'NAT Gateway', data['name'], data['id'], '-', '-', '-', '-', 'Sem Ocupação (30d)', "$32.40"])
 
-    # 7. Load Balancers (ALB e NLB) vazios
+        for qid, meta in ddb_meta.items():
+            r_sum = metrics_30.get(f"r_{qid}", 0.0)
+            w_sum = metrics_30.get(f"w_{qid}", 0.0)
+            if r_sum < 0.1 and w_sum < 0.1:
+                custo_est = round(meta['custo'], 2)
+                detail = f"Provisionado RCU:{meta['rcu']} WCU:{meta['wcu']}" if meta['rcu'] or meta['wcu'] else "Sob Demanda"
+                idle.append([account_name, 'DynamoDB', meta['name'], meta['name'], detail, '-', '-', '-', 'Ociosa (30d)', f"${custo_est}"])
+
+        for qid, meta in cache_meta.items():
+            conn_avg = metrics_30.get(qid, 0.0)
+            if conn_avg < 1.0:
+                custo_est = round(meta['custo'], 2)
+                detail = f"{meta['nodes']}x {meta['type']} ({meta['engine']})"
+                idle.append([account_name, 'ElastiCache', meta['id'], meta['id'], detail, '-', '-', '-', 'Sem Conexões (30d)', f"${custo_est}"])
+
+    # 9. Load Balancers (ALB e NLB) vazios
     print(f"--- MAPEANDO LOAD BALANCERS ---")
     try:
         for lb in elbv2_client.describe_load_balancers().get('LoadBalancers', []):
@@ -198,6 +301,72 @@ def extract_idle_resources(ec2_client, cw_client, rds_client, elbv2_client, acco
                 idle.append([account_name, 'Load Balancer', lb_name, arn.split('/')[-1], lb_type, '-', '-', '-', 'Zero Targets', "$22.00"])
     except Exception as e:
         print(f"Erro ao listar Load Balancers: {e}")
+
+    # 10. CloudWatch Logs sem Retenção
+    print(f"--- MAPEANDO CLOUDWATCH LOGS ---")
+    try:
+        paginator = logs_client.get_paginator('describe_log_groups')
+        for page in paginator.paginate():
+            for lg in page.get('logGroups', []):
+                if 'retentionInDays' not in lg:
+                    lg_name = lg['logGroupName']
+                    stored_bytes = lg.get('storedBytes', 0)
+                    stored_gb = stored_bytes / (1024 ** 3)
+                    custo_logs = round(stored_gb * 0.03, 2)
+                    detail = f"{round(stored_gb, 2)} GB (Sem Retenção)"
+                    idle.append([account_name, 'Log Group', lg_name, lg_name, detail, '-', '-', '-', 'Sem Retenção', f"${custo_logs}"])
+    except Exception as e:
+        print(f"Erro ao listar CloudWatch Logs: {e}")
+
+    # 11. AMIs Órfãs (Imagens não utilizadas)
+    print(f"--- MAPEANDO AMIs ÓRFÃS ---")
+    try:
+        used_amis = set()
+        try:
+            all_insts = [i for r in ec2_client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running', 'shutting-down', 'stopping', 'stopped']}]).get('Reservations', []) for i in r.get('Instances', [])]
+            used_amis = {inst['ImageId'] for inst in all_insts if 'ImageId' in inst}
+        except Exception as e_inst:
+            print(f"Erro ao obter instâncias para AMIs: {e_inst}")
+
+        try:
+            lts = ec2_client.describe_launch_templates().get('LaunchTemplates', [])
+            for lt in lts:
+                lt_id = lt['LaunchTemplateId']
+                versions = ec2_client.describe_launch_template_versions(LaunchTemplateId=lt_id, Versions=['$Default', '$Latest']).get('LaunchTemplateVersions', [])
+                for v in versions:
+                    ami_id = v.get('LaunchTemplateData', {}).get('ImageId')
+                    if ami_id:
+                        used_amis.add(ami_id)
+        except Exception as e_lt:
+            print(f"Erro ao obter Launch Templates para AMIs: {e_lt}")
+
+        my_images = ec2_client.describe_images(Owners=['self']).get('Images', [])
+        for img in my_images:
+            img_id = img['ImageId']
+            if img_id not in used_amis:
+                img_name = img.get('Name', 'Sem Nome')
+                total_snap_size = 0
+                for block in img.get('BlockDeviceMappings', []):
+                    if 'Ebs' in block and 'SnapshotId' in block['Ebs']:
+                        total_snap_size += block['Ebs'].get('VolumeSize', 0)
+                custo_ami = round(total_snap_size * 0.05, 2)
+                idle.append([account_name, 'AMI', img_name, img_id, f"Snapshot: {total_snap_size} GB", '-', '-', '-', 'Órfã (Não Utilizada)', f"${custo_ami}"])
+    except Exception as e:
+        print(f"Erro ao listar AMIs: {e}")
+
+    # 12. Conexões VPN desligadas
+    print(f"--- MAPEANDO VPN CONNECTIONS ---")
+    try:
+        vpns = ec2_client.describe_vpn_connections().get('VpnConnections', [])
+        for vpn in vpns:
+            if vpn['State'] == 'available':
+                vpn_id = vpn['VpnConnectionId']
+                name = next((t['Value'] for t in vpn.get('Tags', []) if t['Key'] == 'Name'), "Sem Nome")
+                telemetry = vpn.get('VgwTelemetry', [])
+                if telemetry and all(t.get('Status') == 'DOWN' for t in telemetry):
+                    idle.append([account_name, 'VPN Connection', name, vpn_id, 'Site-to-Site', '-', '-', '-', 'Desconectada (Down)', "$36.00"])
+    except Exception as e:
+        print(f"Erro ao listar VPN Connections: {e}")
 
     return idle
 
@@ -247,15 +416,21 @@ def main():
             c_cw = boto3.client('cloudwatch', **kargs)
             c_rds = boto3.client('rds', **kargs)
             c_elb = boto3.client('elbv2', **kargs)
+            c_logs = boto3.client('logs', **kargs)
+            c_ddb = boto3.client('dynamodb', **kargs)
+            c_cache = boto3.client('elasticache', **kargs)
         else:
             print(f"Falha de Credencial. Usando fallback (Credenciais Mestres)!")
             c_ec2 = boto3.client('ec2', region_name=REGION)
             c_cw = boto3.client('cloudwatch', region_name=REGION)
             c_rds = boto3.client('rds', region_name=REGION)
             c_elb = boto3.client('elbv2', region_name=REGION)
+            c_logs = boto3.client('logs', region_name=REGION)
+            c_ddb = boto3.client('dynamodb', region_name=REGION)
+            c_cache = boto3.client('elasticache', region_name=REGION)
             
-        # Puxa informações da conta rodando 7 módulos simultâneos 
-        all_idle.extend(extract_idle_resources(c_ec2, c_cw, c_rds, c_elb, account_name))
+        # Puxa informações da conta rodando 12 módulos simultâneos 
+        all_idle.extend(extract_idle_resources(c_ec2, c_cw, c_rds, c_elb, c_logs, c_ddb, c_cache, account_name))
         
     print("\n--- FINALIZANDO ---")
     if all_idle:
